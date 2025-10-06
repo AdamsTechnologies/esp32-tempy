@@ -1,0 +1,323 @@
+esphome:
+  name: esp32-tempy
+  friendly_name: Tempy
+  min_version: 2024.6.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Essentials
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+    password: !secret ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+# I2C bus (faster to smooth redraws)
+i2c:
+  sda: 21
+  scl: 22
+  scan: true
+  # TODO Update frequency if your display is rendering choppy.
+  frequency: 400kHz
+
+# BME280 sensor block (set address to 0x77 if your unit scans there)
+sensor:
+  - platform: bme280_i2c
+    address: 0x76
+    iir_filter: 4x
+    update_interval: 5s
+    temperature:
+      name: "Temperature" # TODO replace with your naming.
+      id: env_temp_c
+      device_class: temperature
+      state_class: measurement
+      unit_of_measurement: "°C"
+      oversampling: 16x
+      on_value:
+        then:
+          - lambda: |-
+              // mark last sensor I2C activity to avoid sliding during heavy bus use
+              id(last_sensor_ms) = millis();
+    humidity:
+      name: "Humidity"
+      id: env_humidity
+      device_class: humidity
+      state_class: measurement
+      unit_of_measurement: "%"
+    pressure:
+      name: "Pressure"
+      id: env_pressure
+      device_class: pressure
+      state_class: measurement
+      unit_of_measurement: "hPa"
+
+  - platform: template
+    name: "Garage Temperature (F)"
+    id: env_temp_f
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      if (isnan(id(env_temp_c).state)) return NAN;
+      return id(env_temp_c).state * 9.0 / 5.0 + 32.0;
+
+# Globals for expression + blink + UI state
+globals:
+  - id: face_mode              # 0=Flat, 1=Pursed, 2=Cute
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: eyes_open
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: blink_ms
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # --- UI state machine ---
+  - id: ui_state               # 0=FACE, 1=SLIDE_F2S, 2=SENSOR, 3=SLIDE_S2F
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: state_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: face_show_ms
+    type: int
+    restore_value: no
+    initial_value: '10000'     # 10s face
+  - id: sensor_show_ms
+    type: int
+    restore_value: no
+    initial_value: '5000'      # 5s sensor page
+  - id: slide_ms
+    type: int
+    restore_value: no
+    initial_value: '800'       # longer slide for smoother motion
+  - id: rng_state
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'         # will seed from millis() on first tick
+  - id: next_mouth_change_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_manual_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_sensor_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# HA select to switch expressions
+select:
+  - platform: template
+    name: "Face Mode"
+    id: face_mode_select
+    optimistic: true
+    options: [Flat, Pursed, Cute]
+    initial_option: Flat
+    set_action:
+      - lambda: |-
+          if (x == "Flat")        { id(face_mode) = 0; }
+          else if (x == "Pursed") { id(face_mode) = 1; }
+          else if (x == "Cute")   { id(face_mode) = 2; }
+          id(last_manual_ms) = millis();
+          id(next_mouth_change_ms) = millis() + 8000;
+
+# Logic loops
+interval:
+  # Blink + mouth cycle
+  - interval: 200ms
+    then:
+      - lambda: |-
+          // --- blink timing ---
+          id(blink_ms) += 200;
+          if (id(blink_ms) >= 4000 && id(blink_ms) < 4120) {
+            id(eyes_open) = false;
+          } else if (id(blink_ms) >= 4120) {
+            id(eyes_open) = true;
+            id(blink_ms) = 0;
+          }
+
+          // --- seed RNG once (xorshift32) ---
+          if (id(rng_state) == 0) {
+            id(rng_state) = (uint32_t)(millis() ^ 0xA5A5F17Eu);
+          }
+
+          // --- mouth auto-cycle (1.0-2.2s), avoid repeats, respect manual cooldown ---
+          const uint32_t now200 = millis();
+          const uint32_t manual_cooldown_ms = 8000;
+          const bool in_cooldown = (id(last_manual_ms) != 0) && (now200 - id(last_manual_ms) < manual_cooldown_ms);
+
+          if (!in_cooldown && now200 >= id(next_mouth_change_ms)) {
+            uint32_t s = id(rng_state);
+            s ^= (s << 13);
+            s ^= (s >> 17);
+            s ^= (s << 5);
+            id(rng_state) = s;
+
+            int next = (int)(s % 3);
+            if (next == id(face_mode)) next = (next + 1) % 3;
+            id(face_mode) = next;
+
+            id(next_mouth_change_ms) = now200 + 1000 + (s % 1200);
+          }
+
+  # ~60 FPS render + state machine
+  - interval: 16ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          if (id(state_start_ms) == 0) { id(state_start_ms) = now; }  // init
+
+          auto elapsed = (int)(now - id(state_start_ms));
+          // avoid sliding within ~400ms of a BME280 transaction
+          const bool safe_window = (id(last_sensor_ms) == 0) || ((now - id(last_sensor_ms)) > 400);
+
+          switch (id(ui_state)) {
+            case 0: // FACE
+              if (elapsed >= id(face_show_ms) && safe_window) { id(ui_state) = 1; id(state_start_ms) = now; }
+              break;
+            case 1: // SLIDE_F2S
+              if (elapsed >= id(slide_ms))     { id(ui_state) = 2; id(state_start_ms) = now; }
+              break;
+            case 2: // SENSOR
+              if (elapsed >= id(sensor_show_ms) && safe_window) { id(ui_state) = 3; id(state_start_ms) = now; }
+              break;
+            case 3: // SLIDE_S2F
+              if (elapsed >= id(slide_ms))     { id(ui_state) = 0; id(state_start_ms) = now; }
+              break;
+          }
+      - component.update: oled
+
+# Fonts
+font:
+  - file: "gfonts://Roboto Mono"
+    id: font_12
+    size: 12
+  - file: "gfonts://Roboto Mono"
+    id: font_14b
+    size: 14
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 128x64"
+    address: 0x3C
+    rotation: 0
+    lambda: |-
+      // Cosine ease-in-out (smoother start/stop)
+      auto ease = [](float p) {
+        if (p < 0) p = 0; if (p > 1) p = 1;
+        return 0.5f - 0.5f * cosf(3.1415926f * p);
+      };
+
+      // --- Mouths ---
+      auto draw_mouth = [&](int cx, int cy){
+        const int mouth_r = 8;  // ensures flat width = 16px, same as cute "U" diameter
+        if (id(face_mode) == 0) {
+          // Flat — same width as cute U
+          it.line(cx - mouth_r, cy, cx + mouth_r, cy, COLOR_ON);
+        } else if (id(face_mode) == 1) {
+          // Pursed (dot)
+          it.filled_circle(cx, cy, 2, COLOR_ON);
+        } else {
+          // Cute (small "U")
+          it.circle(cx, cy, mouth_r, COLOR_ON);
+          it.filled_rectangle(cx - (mouth_r + 1), cy - (mouth_r + 1),
+                              2 * (mouth_r + 1), mouth_r + 1, COLOR_OFF);
+        }
+      };
+
+      // --- Face scene (with eye wander & blink) ---
+      auto draw_face_scene = [&](int xoff){
+        const uint32_t t = millis();
+
+        const int cx = 64 + xoff;
+        const int cy = 28;
+        const int eye_dx = 18;
+        const int eye_y = cy - 6;
+
+        // Subtle eye wander
+        float rad = (t % 5000) * (2.0f * 3.1415926f / 5000.0f);
+        int ex = (int)(2.0f * sinf(rad));          // -2..+2 px
+        int ey = (int)(1.5f * sinf(rad * 1.7f));   // -1..+1 px
+
+        // Blink
+        if (id(eyes_open)) {
+          it.filled_circle(cx - eye_dx + ex, eye_y + ey, 5, COLOR_ON);
+          it.filled_circle(cx + eye_dx + ex, eye_y + ey, 5, COLOR_ON);
+        } else {
+          it.filled_rectangle(cx - eye_dx - 6, eye_y - 1, 12, 2, COLOR_ON);
+          it.filled_rectangle(cx + eye_dx - 6, eye_y - 1, 12, 2, COLOR_ON);
+        }
+
+        // Mouth
+        draw_mouth(cx, cy + 12);
+      };
+
+      // --- Sensor scene (F, %, hPa) ---
+      auto draw_sensor_scene = [&](int xoff){
+        float tc = id(env_temp_c).state;
+        float tf = isnan(tc) ? NAN : (tc * 9.0f / 5.0f + 32.0f);
+        float h  = id(env_humidity).state;
+        float p  = id(env_pressure).state;
+
+        it.printf(0 + xoff, 0,  id(font_14b), COLOR_ON, "Garage Tempy");
+
+        if (isnan(tf)) it.printf(0 + xoff, 18, id(font_12), COLOR_ON, "Temp: --.- F");
+        else           it.printf(0 + xoff, 18, id(font_12), COLOR_ON, "Temp: %.1f F", tf);
+
+        if (isnan(h))  it.printf(0 + xoff, 30, id(font_12), COLOR_ON, "Hum : --.- %%");
+        else           it.printf(0 + xoff, 30, id(font_12), COLOR_ON, "Hum : %.1f %%", h);
+
+        if (isnan(p))  it.printf(0 + xoff, 42, id(font_12), COLOR_ON, "Pres: --.- hPa");
+        else           it.printf(0 + xoff, 42, id(font_12), COLOR_ON, "Pres: %.1f hPa", p);
+      };
+
+      // --- Render with slide effect ---
+      it.fill(COLOR_OFF);
+
+      const uint32_t now = millis();
+      const int st = id(ui_state);
+      const int elapsed = (int)(now - id(state_start_ms));
+      int faceX = 0, dataX = 128;
+
+      if (st == 0) {            // FACE
+        faceX = 0; dataX = 128;
+      } else if (st == 1) {     // SLIDE face -> data
+        float p = ease(elapsed / (float)id(slide_ms));
+        faceX = (int)(-128.0f * p);
+        dataX = faceX + 128;
+      } else if (st == 2) {     // SENSOR
+        faceX = -128; dataX = 0;
+      } else {                  // SLIDE data -> face
+        float p = ease(elapsed / (float)id(slide_ms));
+        dataX = (int)(128.0f * p);
+        faceX = dataX - 128;
+      }
+
+      draw_face_scene(faceX);
+      draw_sensor_scene(dataX);
