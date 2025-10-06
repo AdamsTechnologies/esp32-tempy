@@ -1,4 +1,4 @@
-# Tempy — ESP32 Tempy
+# ESP32 Tempy
 
 **Tempy** is a friendly ESP32-powered temperature, humidity, and pressure sensor that adds a touch of personality to your environment.
 It combines accurate environmental sensing with an expressive OLED “face” that blinks, smiles, and smoothly transitions between a face and live sensor data.
@@ -93,3 +93,4 @@ After flashing, the device exposes:
 * **Modify scene text:** edit the `draw_sensor_scene` lambda for your preferred layout or labels.
 
 ---
+
